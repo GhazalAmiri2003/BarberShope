@@ -1,9 +1,12 @@
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny, IsAdminUser
+from core.permissions import PublicReadManagerWrite
 from rest_framework.response import Response
 from .models import BusinessHours
 
 
 @api_view(["GET"])
+@permission_classes([AllowAny])
 def business_hours(request):
 
     hours = BusinessHours.objects.all()
@@ -22,6 +25,7 @@ def business_hours(request):
 
 
 @api_view(["POST"])
+@permission_classes([IsAdminUser])
 def update_business_hours(request):
 
     day = request.data.get("day")
@@ -54,3 +58,4 @@ class BusinessHoursViewSet(viewsets.ModelViewSet):
     queryset = BusinessHours.objects.all()
 
     serializer_class = BusinessHoursSerializer
+    permission_classes = [PublicReadManagerWrite]
