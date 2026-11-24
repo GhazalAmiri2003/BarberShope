@@ -1,388 +1,221 @@
 from datetime import datetime, timedelta
-
-from rest_framework.decorators import api_view
+from django.db import transaction, OperationalError
+from django.utils import timezone
+from rest_framework import serializers
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
-from django.db import transaction
-
-from .models import Booking, BarberBlock
+from django.shortcuts import get_object_or_404
+from core.permissions import is_manager, manages_barber
+from core.models import BusinessHours
 from barbers.models import Barber
 from services.models import Service
-from core.models import BusinessHours
+from .models import Booking, BarberBlock
 
+STEP = timedelta(minutes=30)
 
-# ---------- Helper ----------
+class DayInput(serializers.Serializer):
+    barber = serializers.IntegerField(min_value=1)
+    date = serializers.DateField()
 
-def time_range(start, end, step_minutes):
+class SlotInput(DayInput):
+    service = serializers.IntegerField(min_value=1)
 
-    start_time = datetime.strptime(start, "%H:%M")
-    end_time = datetime.strptime(end, "%H:%M")
+class BookingInput(SlotInput):
+    start_time = serializers.TimeField(input_formats=["%H:%M", "%H:%M:%S"])
+    customer_name = serializers.CharField(max_length=100, required=False)
 
-    times = []
+class BlockInput(DayInput):
+    start_time = serializers.TimeField()
+    end_time = serializers.TimeField()
+    reason = serializers.CharField(max_length=200, required=False, allow_blank=True)
 
-    while start_time < end_time:
-        times.append(start_time.time())
-        start_time += timedelta(minutes=step_minutes)
+def parse(cls, data):
+    s = cls(data=data)
+    s.is_valid(raise_exception=True)
+    return s.validated_data
 
-    return times
+def hours_for(day):
+    rows = list(BusinessHours.objects.filter(day_of_week=day.weekday())[:2])
+    if len(rows) != 1 or rows[0].is_closed or rows[0].open_time >= rows[0].close_time:
+        return None
+    return rows[0]
 
+def bounds(day, hours):
+    return datetime.combine(day, hours.open_time), datetime.combine(day, hours.close_time)
 
-# ---------- Available Slots ----------
+def starts(day, hours):
+    current, close = bounds(day, hours)
+    while current < close:
+        yield current
+        current += STEP
+
+def future(moment):
+    return moment > timezone.localtime().replace(tzinfo=None)
+
+def eligible(barber, service):
+    if not barber.is_active or not service.is_active or not barber.services.filter(pk=service.pk).exists():
+        raise ValidationError("Service is not offered by this active barber")
+    if not 0 < service.duration_minutes < 1440:
+        raise ValidationError("Invalid service duration")
+
+def overlaps(start, end, other_start, other_end):
+    return start < other_end and end > other_start
+
+def intervals(barber, day):
+    bookings = Booking.objects.filter(barber=barber, date=day, status="booked")
+    blocks = BarberBlock.objects.filter(barber=barber, date=day)
+    return bookings, blocks
+
+def conflicting(barber, day, start, end):
+    return any(q.filter(start_time__lt=end, end_time__gt=start).exists() for q in intervals(barber, day))
+
+def locked_barber(pk):
+    # Stable parent row, including when no reservations yet exist.
+    # SQLite serializes writers using IMMEDIATE transactions in settings.
+    return get_object_or_404(Barber.objects.select_for_update(), pk=pk)
+
+def busy():
+    return Response({"error": "Database busy; retry shortly"}, status=503)
 
 @api_view(["GET"])
+@permission_classes([AllowAny])
 def available_slots(request):
-
-    barber_id = request.GET.get("barber")
-    date = request.GET.get("date")
-    service_id = request.GET.get("service")
-
-    if not barber_id or not date or not service_id:
-        return Response({"error": "barber, date, service required"}, status=400)
-
-    try:
-        barber = Barber.objects.get(id=barber_id)
-        service = Service.objects.get(id=service_id)
-    except:
-        return Response({"error": "invalid barber or service"}, status=400)
-
-    date_obj = datetime.strptime(date, "%Y-%m-%d").date()
-
-    weekday = date_obj.weekday()
-
-    hours = BusinessHours.objects.get(day_of_week=weekday)
-
-    if hours.is_closed:
+    data = parse(SlotInput, request.query_params)
+    barber = get_object_or_404(Barber, pk=data["barber"])
+    service = get_object_or_404(Service, pk=data["service"])
+    eligible(barber, service)
+    day = data["date"]
+    hours = hours_for(day)
+    if not hours:
         return Response([])
-
-    duration = service.duration_minutes
-
-    possible_times = time_range(
-        hours.open_time.strftime("%H:%M"),
-        hours.close_time.strftime("%H:%M"),
-        30
-    )
-
-    bookings = Booking.objects.filter(
-        barber=barber,
-        date=date_obj,
-        status="booked"
-    )
-
-    blocks = BarberBlock.objects.filter(
-        barber=barber,
-        date=date_obj
-    )
-
-    available = []
-
-    for start in possible_times:
-
-        start_dt = datetime.combine(date_obj, start)
-        end_dt = start_dt + timedelta(minutes=duration)
-
-        end_time = end_dt.time()
-
-        if end_time > hours.close_time:
-            continue
-
-        conflict = False
-
-        # check booking conflict
-        for booking in bookings:
-
-            if not (
-                end_time <= booking.start_time
-                or start >= booking.end_time
-            ):
-                conflict = True
-                break
-
-        # check block conflict
-        for block in blocks:
-
-            if not (
-                end_time <= block.start_time
-                or start >= block.end_time
-            ):
-                conflict = True
-                break
-
-        if not conflict:
-            available.append(start.strftime("%H:%M"))
-
-    return Response(available)
-
-
-# ---------- Create Booking ----------
+    bookings, blocks = intervals(barber, day)
+    occupied = list(bookings.values_list("start_time", "end_time")) + list(blocks.values_list("start_time", "end_time"))
+    _, close = bounds(day, hours)
+    result = []
+    for start in starts(day, hours):
+        end = start + timedelta(minutes=service.duration_minutes)
+        if end <= close and future(start) and not any(overlaps(start.time(), end.time(), a, b) for a, b in occupied):
+            result.append(start.strftime("%H:%M"))
+    return Response(result)
 
 @api_view(["POST"])
 def create_booking(request):
-
-    barber_id = request.data.get("barber")
-    service_id = request.data.get("service")
-    date = request.data.get("date")
-    start_time = request.data.get("start_time")
-
-    customer_name = request.data.get("customer_name")
-    customer_phone = request.data.get("customer_phone")
-
+    data = parse(BookingInput, request.data)
+    if request.user.role != "customer":
+        raise PermissionDenied("Customer account required")
     try:
-        barber = Barber.objects.get(id=barber_id)
-        service = Service.objects.get(id=service_id)
-    except:
-        return Response({"error": "invalid barber or service"}, status=400)
-
-    start = datetime.strptime(start_time, "%H:%M").time()
-
-    duration = service.duration_minutes
-
-    date_obj = datetime.strptime(date, "%Y-%m-%d").date()
-
-    start_dt = datetime.combine(date_obj, start)
-    end_dt = start_dt + timedelta(minutes=duration)
-
-    end = end_dt.time()
-
-    # check barber block
-    blocked = BarberBlock.objects.filter(
-        barber=barber,
-        date=date_obj,
-        start_time__lt=end,
-        end_time__gt=start
-    ).exists()
-
-    if blocked:
-        return Response(
-            {"error": "time blocked by barber"},
-            status=400
-        )
-
-    with transaction.atomic():
-
-        conflict = Booking.objects.select_for_update().filter(
-            barber=barber,
-            date=date_obj,
-            start_time__lt=end,
-            end_time__gt=start,
-            status="booked"
-        ).exists()
-
-        if conflict:
-            return Response(
-                {"error": "timeslot already booked"},
-                status=400
-            )
-
-        booking = Booking.objects.create(
-            barber=barber,
-            service=service,
-            date=date_obj,
-            start_time=start,
-            end_time=end,
-            customer_name=customer_name,
-            customer_phone=customer_phone,
-            status="booked"
-        )
-
-    return Response({"booking_id": booking.id})
-
-
-# ---------- Cancel Booking ----------
+        with transaction.atomic():
+            barber = locked_barber(data["barber"])
+            service = get_object_or_404(Service, pk=data["service"])
+            eligible(barber, service)
+            day = data["date"]
+            start = datetime.combine(day, data["start_time"])
+            end = start + timedelta(minutes=service.duration_minutes)
+            hours = hours_for(day)
+            if not hours or start not in starts(day, hours) or end > bounds(day, hours)[1] or not future(start):
+                raise ValidationError("Select a future slot within opening hours on the 30-minute grid")
+            if conflicting(barber, day, start.time(), end.time()):
+                return Response({"error": "Slot unavailable"}, status=409)
+            booking = Booking.objects.create(barber=barber, service=service, customer=request.user,
+                date=day, start_time=start.time(), end_time=end.time(),
+                customer_name=data.get("customer_name") or request.user.first_name or "Customer",
+                customer_phone=request.user.phone)
+        return Response({"booking_id": booking.pk}, status=201)
+    except OperationalError:
+        return busy()
 
 @api_view(["POST"])
 def cancel_booking(request, booking_id):
-
     try:
-        booking = Booking.objects.get(id=booking_id)
-    except Booking.DoesNotExist:
-        return Response({"error": "booking not found"}, status=404)
-
-    booking.status = "cancelled"
-    booking.save(update_fields=["status"])
-
-    return Response({"message": "booking cancelled"})
-
-
-# ---------- Block Time ----------
+        with transaction.atomic():
+            booking = get_object_or_404(Booking.objects.select_related("barber"), pk=booking_id)
+            if booking.customer_id != request.user.pk and not manages_barber(request.user, booking.barber):
+                raise PermissionDenied()
+            locked_barber(booking.barber_id)
+            booking = get_object_or_404(Booking, pk=booking_id)
+            booking.status = "cancelled"
+            booking.save(update_fields=["status"])
+        return Response({"message": "booking cancelled"})
+    except OperationalError:
+        return busy()
 
 @api_view(["POST"])
 def block_time(request):
-
-    barber_id = request.data.get("barber")
-    date = request.data.get("date")
-    start_time = request.data.get("start_time")
-    end_time = request.data.get("end_time")
-    reason = request.data.get("reason")
-
+    data = parse(BlockInput, request.data)
     try:
-        barber = Barber.objects.get(id=barber_id)
-    except Barber.DoesNotExist:
-        return Response({"error": "barber not found"}, status=404)
-
-    # check conflict with bookings
-    conflict = Booking.objects.filter(
-        barber=barber,
-        date= date,
-        start_time__lt=end_time,
-        end_time__gt=start_time,
-        status="booked"
-    ).exists()
-
-    if conflict:
-        return Response({"error": "booking exists in this time"}, status=400)
-
-    block = BarberBlock.objects.create(
-        barber=barber,
-        date=date,
-        start_time=start_time,
-        end_time=end_time,
-        reason=reason
-    )
-
-    return Response({
-        "message": "time blocked",
-        "block_id": block.id
-    })
-
-
-# ---------- Calendar ----------
-
-@api_view(["GET"])
-def calendar_view(request):
-
-    barber_id = request.GET.get("barber")
-    date = request.GET.get("date")
-
-    if not barber_id or not date:
-        return Response({"error": "barber and date required"}, status=400)
-
-    barber = Barber.objects.get(id=barber_id)
-
-    date_obj = datetime.strptime(date, "%Y-%m-%d").date()
-
-    weekday = date_obj.weekday()
-
-    hours = BusinessHours.objects.get(day_of_week=weekday)
-
-    if hours.is_closed:
-        return Response([])
-
-    start = datetime.combine(date_obj, hours.open_time)
-    end = datetime.combine(date_obj, hours.close_time)
-
-    slots = []
-
-    current = start
-
-    while current < end:
-
-        slot_status = "available"
-        extra = {}
-
-        time = current.time()
-
-        booking = Booking.objects.filter(
-            barber=barber,
-            date=date_obj,
-            start_time=time,
-            status="booked"
-        ).select_related("service").first()
-
-        if booking:
-            slot_status = "booked"
-            extra = {
-                "booking_id": booking.id,
-                "customer": booking.customer_name,
-                "phone": booking.customer_phone,
-                "service": booking.service.name,
-                "duration": booking.service.duration_minutes
-            }
-
-        block = BarberBlock.objects.filter(
-            barber=barber,
-            date=date_obj,
-            start_time__lte=time,
-            end_time__gt=time
-        ).first()
-
-        if block:
-            slot_status = "blocked"
-            extra["reason"] = block.reason
-
-        slots.append({
-            "time": time.strftime("%H:%M"),
-            "status": slot_status,
-            **extra
-        })
-
-        current += timedelta(minutes=30)
-
-    return Response(slots)
-
-
-@api_view(["GET"])
-def my_bookings(request):
-
-    phone = request.GET.get("phone")
-
-    if not phone:
-        return Response({"error": "phone required"}, status=400)
-
-    bookings = Booking.objects.filter(
-        customer_phone=phone
-    ).order_by("-date", "-start_time")
-
-    data = []
-
-    for b in bookings:
-        data.append({
-            "id": b.id,
-            "barber": b.barber.name,
-            "service": b.service.name,
-            "date": b.date,
-            "start_time": b.start_time,
-            "end_time": b.end_time,
-            "status": b.status
-        })
-
-    return Response(data)
-
-@api_view(["GET"])
-def barber_bookings(request):
-
-    barber_id = request.GET.get("barber")
-
-    if not barber_id:
-        return Response({"error": "barber required"}, status=400)
-
-    bookings = Booking.objects.filter(
-        barber_id=barber_id,
-        status="booked"
-    ).order_by("date", "start_time")
-
-    data = []
-
-    for b in bookings:
-        data.append({
-            "id": b.id,
-            "customer": b.customer_name,
-            "phone": b.customer_phone,
-            "service": b.service.name,
-            "date": b.date,
-            "start_time": b.start_time,
-            "end_time": b.end_time
-        })
-
-    return Response(data)
-
+        with transaction.atomic():
+            barber = locked_barber(data["barber"])
+            if not manages_barber(request.user, barber):
+                raise PermissionDenied()
+            day = data["date"]
+            start, end = data["start_time"], data["end_time"]
+            hours = hours_for(day)
+            if not hours or not (hours.open_time <= start < end <= hours.close_time) or not future(datetime.combine(day, start)):
+                raise ValidationError("Block must be a future interval within opening hours")
+            if conflicting(barber, day, start, end):
+                return Response({"error": "Interval overlaps a booking or block"}, status=409)
+            block = BarberBlock.objects.create(barber=barber, date=day, start_time=start, end_time=end, reason=data.get("reason", ""))
+        return Response({"message": "time blocked", "block_id": block.pk}, status=201)
+    except OperationalError:
+        return busy()
 
 @api_view(["DELETE"])
 def delete_block(request, block_id):
-
     try:
-        block = BarberBlock.objects.get(id=block_id)
-    except BarberBlock.DoesNotExist:
-        return Response({"error": "block not found"}, status=404)
+        with transaction.atomic():
+            block = get_object_or_404(BarberBlock.objects.select_related("barber"), pk=block_id)
+            if not manages_barber(request.user, block.barber):
+                raise PermissionDenied()
+            locked_barber(block.barber_id)
+            block.delete()
+        return Response(status=204)
+    except OperationalError:
+        return busy()
 
-    block.delete()
+@api_view(["GET"])
+def calendar_view(request):
+    data = parse(DayInput, request.query_params)
+    barber = get_object_or_404(Barber, pk=data["barber"])
+    if not manages_barber(request.user, barber):
+        raise PermissionDenied()
+    day = data["date"]
+    hours = hours_for(day)
+    if not hours:
+        return Response([])
+    bookings, blocks = intervals(barber, day)
+    bookings = list(bookings.select_related("service"))
+    blocks = list(blocks)
+    _, close = bounds(day, hours)
+    result = []
+    for start in starts(day, hours):
+        end = min(start + STEP, close)
+        row = {"time": start.strftime("%H:%M"), "status": "available"}
+        booking = next((b for b in bookings if overlaps(start.time(), end.time(), b.start_time, b.end_time)), None)
+        block = next((b for b in blocks if overlaps(start.time(), end.time(), b.start_time, b.end_time)), None)
+        if booking:
+            row.update(status="booked", booking_id=booking.pk, customer=booking.customer_name,
+                       phone=booking.customer_phone, service=booking.service.name,
+                       duration=int((datetime.combine(day, booking.end_time)-datetime.combine(day, booking.start_time)).total_seconds()/60))
+        elif block:
+            row.update(status="blocked", reason=block.reason)
+        result.append(row)
+    return Response(result)
 
-    return Response({"message": "block removed"})
+@api_view(["GET"])
+def my_bookings(request):
+    # Do not treat knowledge of a phone number as proof of ownership.
+    rows = Booking.objects.filter(customer=request.user).select_related("barber", "service").order_by("-date", "-start_time")
+    return Response([{"id": b.pk, "barber": b.barber.name, "service": b.service.name,
+                      "date": b.date, "start_time": b.start_time, "end_time": b.end_time, "status": b.status} for b in rows])
+
+@api_view(["GET"])
+def barber_bookings(request):
+    q = serializers.IntegerField(min_value=1)
+    barber = get_object_or_404(Barber, pk=q.run_validation(request.query_params.get("barber")))
+    if not manages_barber(request.user, barber):
+        raise PermissionDenied()
+    rows = Booking.objects.filter(barber=barber, status="booked").select_related("service").order_by("date", "start_time")
+    return Response([{"id": b.pk, "customer": b.customer_name, "phone": b.customer_phone,
+                      "service": b.service.name, "date": b.date, "start_time": b.start_time, "end_time": b.end_time} for b in rows])

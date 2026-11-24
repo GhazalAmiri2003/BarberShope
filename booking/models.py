@@ -1,4 +1,5 @@
 from django.db import models
+from django.conf import settings
 from barbers.models import Barber
 from services.models import Service
 
@@ -20,6 +21,8 @@ class Booking(models.Model):
         Service,
         on_delete=models.CASCADE
     )
+
+    customer = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='appointments')
 
     customer_name = models.CharField(max_length=100)
 
