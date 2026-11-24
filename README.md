@@ -49,7 +49,7 @@ python manage.py createsuperuser
 python manage.py runserver
 ```
 
-Use /admin/ to create a user with the barber role (or register a demo user and assign the role as staff), a barber profile, offered services and opening hours. Register a separate customer through the API. Keep real customer data and .env out of source control. To use testB.html, serve this directory locally at port 5500 using `python -m http.server 5500 --bind 127.0.0.1` in a separate terminal, then open http://127.0.0.1:5500/testB.html. Use a clean demo checkout without private files when serving static content.
+Use /admin/ to create a user with the barber role (or register a demo user and assign the role as superuser), a barber profile, offered services and opening hours. Register a separate customer through the API. Keep real customer data and .env out of source control. To use testB.html, copy only that HTML file into a separate empty directory outside the repository. In that directory run `python -m http.server 5500 --bind 127.0.0.1`, then open http://127.0.0.1:5500/testB.html. Never serve the backend directory containing .env or SQLite data.
 
 ## API examples
 
