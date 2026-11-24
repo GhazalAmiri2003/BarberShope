@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Salon Booking Test</title>
+</head>
+
+<body>
+
+<h2>Barbers</h2>
+<select id="barbers"></select>
+
+<h2>Available Days</h2>
+<select id="days"></select>
+
+<h2>Time Slots</h2>
+<ul id="slots"></ul>
+
+<button onclick="book()">Book Appointment</button>
+
+<script>
+
+const API = "http://127.0.0.1:8000/api"
+
+let selectedSlot = null
+
+// ---------- BARBERS ----------
+async function loadBarbers(){
+
+    const res = await fetch(API + "/barbers/")
+    const data = await res.json()
+
+    const select = document.getElementById("barbers")
+    select.innerHTML = ""
+
+    data.forEach(barber => {
+
+        const option = document.createElement("option")
+        option.value = barber.id
+        option.textContent = barber.name
+
+        select.appendChild(option)
+
+    })
+
+    if(data.length > 0){
+        loadDays()
+    }
+
+}
+
+
+// ---------- DAYS ----------
+async function loadDays(){
+
+    const barberId = document.getElementById("barbers").value
+
+    const res = await fetch(API + `/barbers/${barberId}/available-days/`)
+    const days = await res.json()
+
+    const select = document.getElementById("days")
+    select.innerHTML = ""
+
+    days.forEach(day => {
+
+        const option = document.createElement("option")
+        option.value = day
+        option.textContent = day
+
+        select.appendChild(option)
+
+    })
+
+    if(days.length > 0){
+        loadSlots()
+    }
+
+}
+
+
+// ---------- TIMESLOTS ----------
+async function loadSlots(){
+
+    const barberId = document.getElementById("barbers").value
+    const date = document.getElementById("days").value
+
+    const res = await fetch(API + `/timeslots/?barber=${barberId}&date=${date}`)
+    const slots = await res.json()
+
+    const list = document.getElementById("slots")
+    list.innerHTML = ""
+
+    slots.forEach(slot => {
+
+        const li = document.createElement("li")
+
+        li.textContent = slot.start_time + " - " + slot.end_time
+
+        li.onclick = () => {
+
+            selectedSlot = slot.id
+
+            document.querySelectorAll("#slots li").forEach(el => el.style.background = "")
+            li.style.background = "lightgreen"
+
+        }
+
+        list.appendChild(li)
+
+    })
+
+}
+
+
+// ---------- BOOK ----------
+async function book(){
+
+    if(!selectedSlot){
+        alert("select timeslot first")
+        return
+    }
+
+    const barberId = document.getElementById("barbers").value
+
+    const body = {
+
+        customer: 1,
+        barber: barberId,
+        timeslot: selectedSlot,
+        service: "haircut"
+
+    }
+
+    const res = await fetch(API + "/bookings/", {
+
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body)
+
+    })
+
+    const data = await res.json()
+
+    alert("Booking Created")
+
+    loadSlots()
+
+}
+
+
+// EVENTS
+document.getElementById("barbers").addEventListener("change", loadDays)
+document.getElementById("days").addEventListener("change", loadSlots)
+
+loadBarbers()
+
+</script>
+
+</body>
+</html>
