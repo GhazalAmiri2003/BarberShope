@@ -1,161 +1,50 @@
-<!DOCTYPE html>
-<html>
-<head>
-<title>Salon Booking Test</title>
-</head>
-
-<body>
-
-<h2>Barbers</h2>
-<select id="barbers"></select>
-
-<h2>Available Days</h2>
-<select id="days"></select>
-
-<h2>Time Slots</h2>
-<ul id="slots"></ul>
-
-<button onclick="book()">Book Appointment</button>
-
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Salon Booking API Demo</title>
+<style>body{font:16px system-ui;max-width:620px;margin:32px auto;padding:16px}label{display:block;margin:12px 0}input,select,button{font:inherit;padding:8px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style></head>
+<body><h1>Salon Booking API Demo</h1><p>Local development only. Use a customer account and synthetic test data.</p>
+<label>Phone <input id="phone" type="tel"></label><label>Password <input id="password" type="password"></label><button id="login">Sign in</button>
+<label>Barber <select id="barber"></select></label><label>Service <select id="service"></select></label><label>Date <input id="date" type="date"></label><button id="load">Find slots</button>
+<label>Start time <select id="slot"></select></label><button id="book">Book appointment</button><pre id="status" role="status"></pre>
 <script>
-
-const API = "http://127.0.0.1:8000/api"
-
-let selectedSlot = null
-
-// ---------- BARBERS ----------
-async function loadBarbers(){
-
-    const res = await fetch(API + "/barbers/")
-    const data = await res.json()
-
-    const select = document.getElementById("barbers")
-    select.innerHTML = ""
-
-    data.forEach(barber => {
-
-        const option = document.createElement("option")
-        option.value = barber.id
-        option.textContent = barber.name
-
-        select.appendChild(option)
-
-    })
-
-    if(data.length > 0){
-        loadDays()
-    }
-
+const api = "http://127.0.0.1:8000/api/";
+const el = id => document.getElementById(id);
+let access = "";
+async function request(path, body) {
+ const headers = {};
+ if (access) headers.Authorization = "Bearer " + access;
+ if (body) headers["Content-Type"] = "application/json";
+ const response = await fetch(api + path, {method:body?"POST":"GET", headers, ...(body?{body:JSON.stringify(body)}:{})});
+ const data = await response.json();
+ if (!response.ok) throw Error(JSON.stringify(data));
+ return data;
 }
-
-
-// ---------- DAYS ----------
-async function loadDays(){
-
-    const barberId = document.getElementById("barbers").value
-
-    const res = await fetch(API + `/barbers/${barberId}/available-days/`)
-    const days = await res.json()
-
-    const select = document.getElementById("days")
-    select.innerHTML = ""
-
-    days.forEach(day => {
-
-        const option = document.createElement("option")
-        option.value = day
-        option.textContent = day
-
-        select.appendChild(option)
-
-    })
-
-    if(days.length > 0){
-        loadSlots()
-    }
-
+function options(id, rows) {
+ el(id).replaceChildren(...rows.map(([value,label])=>new Option(label,value)));
 }
-
-
-// ---------- TIMESLOTS ----------
-async function loadSlots(){
-
-    const barberId = document.getElementById("barbers").value
-    const date = document.getElementById("days").value
-
-    const res = await fetch(API + `/timeslots/?barber=${barberId}&date=${date}`)
-    const slots = await res.json()
-
-    const list = document.getElementById("slots")
-    list.innerHTML = ""
-
-    slots.forEach(slot => {
-
-        const li = document.createElement("li")
-
-        li.textContent = slot.start_time + " - " + slot.end_time
-
-        li.onclick = () => {
-
-            selectedSlot = slot.id
-
-            document.querySelectorAll("#slots li").forEach(el => el.style.background = "")
-            li.style.background = "lightgreen"
-
-        }
-
-        list.appendChild(li)
-
-    })
-
+let barbers=[],services=[];
+function updateServices(){
+ const b=barbers.find(x=>String(x.id)===el("barber").value);
+ options("service",services.filter(x=>b?.services.includes(x.id)).map(x=>[x.id,x.name]));
+ options("slot",[]);
 }
-
-
-// ---------- BOOK ----------
-async function book(){
-
-    if(!selectedSlot){
-        alert("select timeslot first")
-        return
-    }
-
-    const barberId = document.getElementById("barbers").value
-
-    const body = {
-
-        customer: 1,
-        barber: barberId,
-        timeslot: selectedSlot,
-        service: "haircut"
-
-    }
-
-    const res = await fetch(API + "/bookings/", {
-
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify(body)
-
-    })
-
-    const data = await res.json()
-
-    alert("Booking Created")
-
-    loadSlots()
-
-}
-
-
-// EVENTS
-document.getElementById("barbers").addEventListener("change", loadDays)
-document.getElementById("days").addEventListener("change", loadSlots)
-
-loadBarbers()
-
-</script>
-
-</body>
-</html>
+async function safe(fn){try{await fn()}catch(e){el("status").textContent=e.message}}
+el("login").onclick=()=>safe(async()=>{
+ access="";
+ const data=await request("auth/login/",{phone:el("phone").value,password:el("password").value});
+ access=data.access;el("password").value="";el("status").textContent="Signed in";
+});
+el("load").onclick=()=>safe(async()=>{
+ options("slot",[]);
+ const query=new URLSearchParams({barber:el("barber").value,service:el("service").value,date:el("date").value});
+ const rows=await request("available-slots/?"+query);
+ options("slot",rows.map(x=>[x,x]));el("status").textContent=rows.length+" available slots";
+});
+for (const id of ["service","date"]) el(id).onchange=()=>options("slot",[]);
+el("barber").onchange=updateServices;
+el("book").onclick=()=>safe(async()=>{
+ if(!access||!el("slot").value)throw Error("Sign in and select a slot first");
+ const result=await request("bookings/",{barber:Number(el("barber").value),service:Number(el("service").value),date:el("date").value,start_time:el("slot").value});
+ options("slot",[]);el("status").textContent="Booking created: "+result.booking_id;
+});
+safe(async()=>{[barbers,services]=await Promise.all([request("barbers/"),request("services/")]);options("barber",barbers.map(x=>[x.id,x.name]));updateServices()});
+</script></body></html>
